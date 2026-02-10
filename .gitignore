@@ -1,0 +1,19 @@
+# Ambiente virtual
+venv/
+.env
+.venv
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# Banco de dados local
+*.db
+*.sqlite3
+
+# IDEs
+.vscode/
+.idea/
