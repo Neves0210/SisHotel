@@ -1,3 +1,5 @@
+import os
+import shutil
 import sqlite3
 from datetime import date, datetime
 import pandas as pd
@@ -28,6 +30,72 @@ STATUSES = ["OK", "Problema", "N/A"]
 
 DB_PATH = "manutencao_hotel.db"
 
+# ----------------------------
+# MIGRATIONS (produção)
+# ----------------------------
+CURRENT_SCHEMA_VERSION = 2  # aumente quando mudar o schema
+
+def backup_db():
+    if not os.path.exists(DB_PATH):
+        return
+    os.makedirs("backups", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    shutil.copy2(DB_PATH, f"backups/manutencao_hotel_{ts}.db")
+
+def ensure_schema_meta(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL
+        );
+    """)
+    cur.execute("INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, 1);")
+
+def get_schema_version(cur) -> int:
+    cur.execute("SELECT version FROM schema_meta WHERE id = 1;")
+    return int(cur.fetchone()[0])
+
+def set_schema_version(cur, v: int):
+    cur.execute("UPDATE schema_meta SET version = ? WHERE id = 1;", (v,))
+
+def table_has_column(cur, table: str, column: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table});")
+    return any(row[1] == column for row in cur.fetchall())
+
+def migrate_if_needed(cur):
+    ensure_schema_meta(cur)
+    v = get_schema_version(cur)
+
+    # v1 -> v2: adiciona floor/apt/room_code e converte a coluna antiga "room" (1..216)
+    if v < 2:
+        if not table_has_column(cur, "reports", "floor"):
+            cur.execute("ALTER TABLE reports ADD COLUMN floor INTEGER;")
+        if not table_has_column(cur, "reports", "apt"):
+            cur.execute("ALTER TABLE reports ADD COLUMN apt INTEGER;")
+        if not table_has_column(cur, "reports", "room_code"):
+            cur.execute("ALTER TABLE reports ADD COLUMN room_code TEXT;")
+
+        # Se existia "room", converte
+        if table_has_column(cur, "reports", "room"):
+            cur.execute("""
+                UPDATE reports
+                SET
+                  floor = ((room - 1) / 18) + 1,
+                  apt   = ((room - 1) % 18) + 1
+                WHERE floor IS NULL OR apt IS NULL;
+            """)
+            cur.execute("""
+                UPDATE reports
+                SET room_code = printf('%02d%02d', floor, apt)
+                WHERE room_code IS NULL OR room_code = '';
+            """)
+
+        # Índices novos
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_roomcode ON reports(room_code);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_floor_apt ON reports(floor, apt);")
+
+        set_schema_version(cur, 2)
 
 # ----------------------------
 # HELPERS
@@ -42,23 +110,30 @@ def get_conn():
 
 
 def init_db():
+    # Em produção: sempre backup antes de migrar
+    backup_db()
+
     conn = get_conn()
     cur = conn.cursor()
 
-    # Tabela principal do relatório
+    # Cria tabelas se não existirem (deixa colunas antigas opcionais para migração)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             report_date TEXT NOT NULL,
-            floor INTEGER NOT NULL,
-            apt INTEGER NOT NULL,
-            room_code TEXT NOT NULL,
             technician TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+
+            -- novo schema
+            floor INTEGER,
+            apt INTEGER,
+            room_code TEXT,
+
+            -- antigo schema (pode existir em bancos antigos)
+            room INTEGER
         );
     """)
 
-    # Itens do relatório
     cur.execute("""
         CREATE TABLE IF NOT EXISTS report_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,14 +145,11 @@ def init_db():
         );
     """)
 
-    # Índices para filtros
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_roomcode ON reports(room_code);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_floor_apt ON reports(floor, apt);")
+    # Roda migração se precisar
+    migrate_if_needed(cur)
 
     conn.commit()
     conn.close()
-
 
 def insert_report(report_date: date, floor: int, apt: int, technician: str, items_payload: list[dict]):
     conn = get_conn()
