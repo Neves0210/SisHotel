@@ -354,7 +354,7 @@ def fetch_reports(
 # ----------------------------
 init_db()
 
-st.title("🛠️ Relatório Diário de Manutenção - Hotel (12 andares x 18 aptos)")
+st.title("🛠️ Relatório Diário de Manutenção - Hotel")
 
 menu = st.sidebar.radio("Navegação", ["Registrar manutenção", "Relatórios", "Pendências", "Itens"])
 st.sidebar.markdown("---")
@@ -362,6 +362,12 @@ st.sidebar.caption("Dados salvos localmente em SQLite (manutencao_hotel.db).")
 
 if menu == "Registrar manutenção":
     st.subheader("Registrar manutenção do dia")
+
+    if "reset_token" not in st.session_state:
+        st.session_state["reset_token"] = 0
+
+    if "saving" not in st.session_state:
+        st.session_state["saving"] = False
 
     colA, colB, colC, colD = st.columns(4)
     with colA:
@@ -379,41 +385,87 @@ if menu == "Registrar manutenção":
     items_df = list_items(active_only=True)
     if items_df.empty:
         st.warning("Nenhum item ativo cadastrado. Vá em 'Itens' e cadastre/ative os itens.")
-    else:
-        st.markdown("### Checklist dos itens")
-        st.caption("Use N/A quando não se aplica. Marque Problema para gerar pendências.")
+        st.stop()
 
-        items_payload = []
-        for _, row in items_df.iterrows():
-            item_id = int(row["id"])
-            item_name = row["name"]
+    st.markdown("### Itens vistoriados no quarto")
+    st.caption("Selecione apenas o que você realmente vistoriou/mexeu. O que não for selecionado não será salvo.")
 
-            with st.container(border=True):
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    status = st.selectbox(item_name, STATUSES, index=0, key=f"status_{item_id}")
-                with c2:
-                    note = st.text_input(
-                        "Observação (opcional)",
-                        key=f"note_{item_id}",
-                        placeholder="Ex: pilhas fracas / troca solicitada / peça quebrada"
-                    )
+    options = [(int(r["id"]), r["name"]) for _, r in items_df.iterrows()]
+    name_by_id = {item_id: name for item_id, name in options}
 
-            items_payload.append({"item_id": item_id, "item": item_name, "status": status, "note": note})
+    selected_names = st.multiselect(
+        "Selecione os itens vistoriados",
+        options=[name for _, name in options],
+        placeholder="Ex: Frigobar, Luzes, Tomadas...",
+        key=f"vistoria_selected_names_{st.session_state['reset_token']}"
+    )
 
-        st.markdown("---")
-        colS1, colS2 = st.columns([1, 3])
-        with colS1:
-            save = st.button("💾 Salvar relatório", type="primary")
-        with colS2:
-            st.caption("Cada item vira uma linha no relatório (facilita filtro e pendências).")
+    selected_ids = [item_id for item_id, name in options if name in selected_names]
 
-        if save:
-            if not technician.strip():
-                st.error("Informe o nome do responsável/técnico.")
-            else:
-                insert_report(report_date, int(floor), int(apt), technician, items_payload)
-                st.success(f"Relatório salvo! ✅ (Quarto {code} - {report_date.strftime('%d/%m/%Y')})")
+    st.markdown("### Detalhes dos itens selecionados")
+    items_payload = []
+
+    for item_id in selected_ids:
+        item_name = name_by_id[item_id]
+
+        # chaves por quarto+data+item para não "vazar" estado entre quartos
+        base_key = f"{report_date.isoformat()}_{code}_{item_id}"
+
+        with st.container(border=True):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                status = st.selectbox(
+                    item_name,
+                    ["OK", "Problema"],
+                    index=0,
+                    key=f"status_{base_key}",
+                )
+            with c2:
+                note = st.text_input(
+                    "Observação (opcional)",
+                    key=f"note_{base_key}",
+                    placeholder="Ex: trocado / ajustado / peça quebrada"
+                )
+
+        items_payload.append({
+            "item_id": item_id,
+            "item": item_name,
+            "status": status,
+            "note": note
+        })
+
+    st.markdown("---")
+    colS1, colS2 = st.columns([1, 3])
+    with colS1:
+        save = st.button("💾 Salvar relatório", type="primary", disabled=st.session_state["saving"])
+    with colS2:
+        st.caption("Cada item selecionado vira uma linha no relatório.")
+
+    if save:
+        if st.session_state["saving"]:
+            st.warning("Salvando... aguarde.")
+            st.stop()
+
+        st.session_state["saving"] = True
+
+        if not technician.strip():
+            st.session_state["saving"] = False
+            st.error("Informe o nome do responsável/técnico.")
+            st.stop()
+
+        if not items_payload:
+            st.session_state["saving"] = False
+            st.error("Selecione pelo menos 1 item vistoriado antes de salvar.")
+            st.stop()
+
+        insert_report(report_date, int(floor), int(apt), technician, items_payload)
+
+        st.session_state["saving"] = False
+        st.success(f"Relatório salvo! ✅ (Quarto {code} - {report_date.strftime('%d/%m/%Y')})")
+
+        # reset do multiselect (sem erro)
+        st.session_state["reset_token"] += 1
+        st.rerun()
 
 elif menu == "Relatórios":
     st.subheader("Relatórios e exportação")
