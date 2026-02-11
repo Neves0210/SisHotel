@@ -117,6 +117,88 @@ def fetch_resolved(date_from: date, date_to: date, floor: int | None):
         conn.close()
         return df
 
+GM_STATUSES = ["Aberto", "Em andamento", "Resolvido"]
+def insert_general_maintenance(maint_date: date, place: str, description: str, status: str, technician: str, note: str):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO general_maintenance
+        (maint_date, place, description, status, technician, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        maint_date.isoformat(),
+        place.strip(),
+        description.strip(),
+        status,
+        technician.strip(),
+        (note.strip() or None),
+        datetime.now().isoformat(timespec="seconds"),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def fetch_general_maintenance(date_from: date, date_to: date, status: str | None, search: str | None):
+    conn = get_conn()
+
+    q = """
+        SELECT
+            id,
+            maint_date,
+            place,
+            description,
+            status,
+            technician,
+            COALESCE(note, '') AS note,
+            created_at,
+            COALESCE(resolved_at, '') AS resolved_at,
+            COALESCE(resolved_by, '') AS resolved_by,
+            COALESCE(resolution_note, '') AS resolution_note
+        FROM general_maintenance
+        WHERE maint_date BETWEEN ? AND ?
+    """
+    params = [date_from.isoformat(), date_to.isoformat()]
+
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+
+    if search:
+        q += " AND (LOWER(place) LIKE ? OR LOWER(description) LIKE ? OR LOWER(technician) LIKE ?)"
+        s = f"%{search.lower().strip()}%"
+        params += [s, s, s]
+
+    q += " ORDER BY maint_date DESC, id DESC;"
+
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+
+def resolve_general_maintenance(gm_id: int, resolved_by: str, resolution_note: str):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE general_maintenance
+        SET
+          status = 'Resolvido',
+          resolved_at = ?,
+          resolved_by = ?,
+          resolution_note = ?
+        WHERE id = ?;
+    """, (
+        datetime.now().isoformat(timespec="seconds"),
+        resolved_by.strip(),
+        (resolution_note.strip() or None),
+        gm_id
+    ))
+
+    conn.commit()
+    conn.close()
+
 # ----------------------------
 # MIGRATIONS (produção)
 # ----------------------------
@@ -272,7 +354,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             report_date TEXT NOT NULL,
             technician TEXT NOT NULL,
-            created_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,   
 
             floor INTEGER,
             apt INTEGER,
@@ -293,6 +375,25 @@ def init_db():
             FOREIGN KEY(report_id) REFERENCES reports(id)
         );
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS general_maintenance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        maint_date TEXT NOT NULL,
+        place TEXT NOT NULL,
+        description TEXT NOT NULL,
+        status TEXT NOT NULL,
+        technician TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        resolved_by TEXT,
+        resolution_note TEXT
+    );
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_gm_date ON general_maintenance(maint_date);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_gm_status ON general_maintenance(status);")
 
     migrate_if_needed(cur)
 
@@ -459,7 +560,7 @@ init_db()
 
 st.title("🛠️ Relatório Diário de Manutenção - Hotel")
 
-menu = st.sidebar.radio("Navegação", ["Registrar manutenção", "Relatórios", "Pendências", "Itens"])
+menu = st.sidebar.radio("Navegação", ["Registrar manutenção", "Manutenção Geral", "Relatórios", "Pendências", "Itens"])
 st.sidebar.markdown("---")
 st.sidebar.caption("Dados salvos localmente em SQLite (manutencao_hotel.db).")
 
@@ -573,7 +674,7 @@ if menu == "Registrar manutenção":
 elif menu == "Relatórios":
     st.subheader("Relatórios e exportação")
 
-    tab1, tab2 = st.tabs(["📄 Relatórios", "✅ Resolvidas"])
+    tab1, tab2, tab3 = st.tabs(["📄 Relatórios", "✅ Pendencias Resolvidas", "🧰 Manutenção Geral"])
 
     # -----------------------------
     # TAB 1 - RELATÓRIOS (igual ao seu, só que dentro do tab1)
@@ -687,7 +788,171 @@ elif menu == "Relatórios":
                     mime="text/csv",
                     key="res_csv"
                 )
-                
+        # -----------------------------
+    # TAB 3 - MANUTENÇÃO GERAL
+    # -----------------------------
+    with tab3:
+        st.markdown("### Manutenção Geral (fora dos apartamentos)")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            gm_from = st.date_input("De", value=date.today(), key="rep_gm_from")
+        with col2:
+            gm_to = st.date_input("Até", value=date.today(), key="rep_gm_to")
+        with col3:
+            gm_status = st.selectbox("Status", ["(todos)"] + GM_STATUSES, index=0, key="rep_gm_status")
+            gm_status_val = None if gm_status == "(todos)" else gm_status
+
+        gm_search = st.text_input(
+            "Buscar (local/descrição/técnico)",
+            placeholder="Ex: elevador / recepção / gabriel",
+            key="rep_gm_search"
+        )
+
+        if gm_from > gm_to:
+            st.error("A data 'De' não pode ser maior que a data 'Até'.")
+        else:
+            df_gm = fetch_general_maintenance(gm_from, gm_to, gm_status_val, gm_search)
+
+            if df_gm.empty:
+                st.info("Nada encontrado.")
+            else:
+                st.success(f"{len(df_gm)} registro(s) encontrado(s).")
+
+                show_cols_gm = [
+                    "maint_date", "place", "description", "status",
+                    "technician", "note",
+                    "resolved_at", "resolved_by", "resolution_note",
+                    "created_at", "id"
+                ]
+                st.dataframe(df_gm[show_cols_gm], use_container_width=True, hide_index=True)
+
+                csv_gm = df_gm[show_cols_gm].to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Baixar CSV (Manutenção Geral)",
+                    data=csv_gm,
+                    file_name=f"relatorio_manutencao_geral_{gm_from.isoformat()}_a_{gm_to.isoformat()}.csv",
+                    mime="text/csv",
+                    key="rep_gm_csv"
+                )
+
+                st.markdown("---")
+                st.markdown("### ✅ Resolver (opcional)")
+
+                resolved_by = st.text_input("Quem resolveu?", placeholder="Ex: Gabriel / Manutenção", key="rep_gm_res_by")
+
+                pend = df_gm[df_gm["status"] != "Resolvido"].copy()
+                if pend.empty:
+                    st.success("Nenhuma manutenção geral pendente ✅")
+                else:
+                    for _, row in pend.iterrows():
+                        gm_id = int(row["id"])
+                        title = f"{row['maint_date']} • {row['place']} • {row['status']}"
+                        with st.expander(title):
+                            st.write(f"**Descrição:** {row['description']}")
+                            st.write(f"**Registrado por:** {row['technician']}")
+                            if row["note"]:
+                                st.write(f"**Obs:** {row['note']}")
+
+                            res_note = st.text_area("O que foi feito?", key=f"rep_gm_res_note_{gm_id}")
+
+                            if st.button("✅ Marcar como resolvido", type="primary", key=f"rep_gm_btn_res_{gm_id}"):
+                                if not resolved_by.strip():
+                                    st.error("Informe quem resolveu.")
+                                    st.stop()
+                                resolve_general_maintenance(gm_id, resolved_by, res_note)
+                                st.success("Marcado como resolvido! ✅")
+                                st.rerun()
+
+elif menu == "Manutenção Geral":
+    st.subheader("🧰 Manutenção Geral (fora dos apartamentos)")
+
+    tabG1, tabG2 = st.tabs(["➕ Registrar", "📄 Consultar / Resolver"])
+
+    with tabG1:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            maint_date = st.date_input("Data", value=date.today(), key="gm_date")
+        with c2:
+            place = st.text_input("Local", placeholder="Ex: Recepção, Corredor, Elevador, Piscina...", key="gm_place")
+        with c3:
+            status = st.selectbox("Status", GM_STATUSES, index=0, key="gm_status")
+
+        technician = st.text_input("Responsável / Técnico", placeholder="Ex: Gabriel / Manutenção", key="gm_tech")
+        description = st.text_area("Descrição do serviço", placeholder="Ex: Troca de lâmpadas do corredor...", key="gm_desc")
+        note = st.text_area("Observação (opcional)", key="gm_note")
+
+        if st.button("💾 Salvar Manutenção Geral", type="primary", key="gm_save"):
+            if not place.strip() or not technician.strip() or not description.strip():
+                st.error("Preencha Local, Responsável e Descrição.")
+            else:
+                insert_general_maintenance(maint_date, place, description, status, technician, note)
+                st.success("Registro salvo! ✅")
+                st.rerun()
+
+    with tabG2:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            df_from = st.date_input("De", value=date.today(), key="gm_from")
+        with col2:
+            df_to = st.date_input("Até", value=date.today(), key="gm_to")
+        with col3:
+            st_filter = st.selectbox("Status", ["(todos)"] + GM_STATUSES, index=0, key="gm_filter_status")
+            st_val = None if st_filter == "(todos)" else st_filter
+
+        search = st.text_input("Buscar (local/descrição/técnico)", placeholder="Ex: elevador / recepção / gabriel", key="gm_search")
+
+        if df_from > df_to:
+            st.error("A data 'De' não pode ser maior que a data 'Até'.")
+            st.stop()
+
+        df = fetch_general_maintenance(df_from, df_to, st_val, search)
+
+        if df.empty:
+            st.info("Nada encontrado.")
+        else:
+            show_cols = ["maint_date", "place", "description", "status", "technician", "note", "resolved_at", "resolved_by", "resolution_note", "created_at", "id"]
+            st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
+            csv = df[show_cols].to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Baixar CSV (Manutenção Geral)",
+                data=csv,
+                file_name=f"manutencao_geral_{df_from.isoformat()}_a_{df_to.isoformat()}.csv",
+                mime="text/csv",
+                key="gm_csv"
+            )
+
+            st.markdown("---")
+            st.markdown("### ✅ Resolver manutenção geral")
+
+            resolved_by = st.text_input("Quem resolveu?", placeholder="Ex: Gabriel / Manutenção", key="gm_res_by")
+
+            # Mostra só as que não estão resolvidas para resolver
+            pend = df[df["status"] != "Resolvido"].copy()
+
+            if pend.empty:
+                st.success("Nenhuma manutenção geral pendente ✅")
+            else:
+                for _, row in pend.iterrows():
+                    gm_id = int(row["id"])
+                    title = f"{row['maint_date']} • {row['place']} • {row['status']}"
+                    with st.expander(title):
+                        st.write(f"**Descrição:** {row['description']}")
+                        st.write(f"**Registrado por:** {row['technician']}")
+                        if row["note"]:
+                            st.write(f"**Obs:** {row['note']}")
+
+                        res_note = st.text_area("O que foi feito?", key=f"gm_res_note_{gm_id}")
+
+                        if st.button("✅ Marcar como resolvido", type="primary", key=f"gm_btn_res_{gm_id}"):
+                            if not resolved_by.strip():
+                                st.error("Informe quem resolveu.")
+                                st.stop()
+                            resolve_general_maintenance(gm_id, resolved_by, res_note)
+                            st.success("Marcado como resolvido! ✅")
+                            st.rerun()
+
 elif menu == "Pendências":
     st.subheader("Pendências (itens com PROBLEMA)")
 
