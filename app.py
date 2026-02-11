@@ -26,6 +26,96 @@ def room_code(floor: int, apt: int) -> str:
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+def fetch_pendencies_open(date_from: date, date_to: date, floor: int | None):
+    conn = get_conn()
+    query = """
+        SELECT
+            r.id AS report_id,
+            r.report_date,
+            r.room_code,
+            r.floor,
+            r.apt,
+            r.technician,
+            r.created_at,
+            ri.id AS report_item_id,
+            ri.item,
+            ri.status,
+            COALESCE(ri.note, '') AS note
+        FROM reports r
+        JOIN report_items ri ON ri.report_id = r.id
+        WHERE r.report_date BETWEEN ? AND ?
+          AND ri.status = 'Problema'
+          AND ri.resolved_at IS NULL
+    """
+    params = [date_from.isoformat(), date_to.isoformat()]
+
+    if floor is not None:
+        query += " AND r.floor = ?"
+        params.append(floor)
+
+    query += " ORDER BY r.report_date DESC, r.room_code ASC, r.id DESC;"
+
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+def resolve_pendency(report_item_id: int, resolved_by: str, resolution_note: str):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE report_items
+        SET
+          resolved_at = ?,
+          resolved_by = ?,
+          resolution_note = ?
+        WHERE id = ?
+          AND status = 'Problema'
+          AND resolved_at IS NULL;
+    """, (
+        datetime.now().isoformat(timespec="seconds"),
+        resolved_by.strip(),
+        (resolution_note.strip() or None),
+        report_item_id
+    ))
+
+    conn.commit()
+    conn.close()
+    
+def fetch_resolved(date_from: date, date_to: date, floor: int | None):
+        conn = get_conn()
+        query = """
+            SELECT
+                r.id AS report_id,
+                r.report_date,
+                r.room_code,
+                r.floor,
+                r.apt,
+                r.technician,
+                r.created_at,
+                ri.item,
+                ri.status,
+                COALESCE(ri.note, '') AS note,
+                ri.resolved_at,
+                COALESCE(ri.resolved_by, '') AS resolved_by,
+                COALESCE(ri.resolution_note, '') AS resolution_note
+            FROM reports r
+            JOIN report_items ri ON ri.report_id = r.id
+            WHERE r.report_date BETWEEN ? AND ?
+            AND ri.status = 'Problema'
+            AND ri.resolved_at IS NOT NULL
+        """
+        params = [date_from.isoformat(), date_to.isoformat()]
+
+        if floor is not None:
+            query += " AND r.floor = ?"
+            params.append(floor)
+
+        query += " ORDER BY ri.resolved_at DESC, r.room_code ASC;"
+
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        return df
 
 # ----------------------------
 # MIGRATIONS (produção)
@@ -67,6 +157,7 @@ def migrate_if_needed(cur):
     v1: reports com 'room' (1..216) e report_items com 'item' texto
     v2: adiciona floor, apt, room_code e converte room -> floor/apt/room_code
     v3: cria maintenance_items e adiciona item_id no report_items (itens cadastráveis)
+    v4: resolução das pendencias
     """
     ensure_schema_meta(cur)
     v = get_schema_version(cur)
@@ -120,6 +211,18 @@ def migrate_if_needed(cur):
 
         set_schema_version(cur, 3)
 
+    # v4 - campos para resolver pendências
+    if v < 4:
+        if not table_has_column(cur, "report_items", "resolved_at"):
+            cur.execute("ALTER TABLE report_items ADD COLUMN resolved_at TEXT;")
+        if not table_has_column(cur, "report_items", "resolved_by"):
+            cur.execute("ALTER TABLE report_items ADD COLUMN resolved_by TEXT;")
+        if not table_has_column(cur, "report_items", "resolution_note"):
+            cur.execute("ALTER TABLE report_items ADD COLUMN resolution_note TEXT;")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_report_items_resolved_at ON report_items(resolved_at);")
+
+        set_schema_version(cur, 4)
 
 def seed_default_items_if_empty():
     defaults = [
@@ -470,55 +573,121 @@ if menu == "Registrar manutenção":
 elif menu == "Relatórios":
     st.subheader("Relatórios e exportação")
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        date_from = st.date_input("De", value=date.today())
-    with col2:
-        date_to = st.date_input("Até", value=date.today())
-    with col3:
-        filter_mode = st.selectbox("Filtrar por", ["(nenhum)", "Andar/Apto", "Código do quarto (ex: 0101)"], index=0)
-    with col4:
-        status = st.selectbox("Status do item", ["(todos)"] + STATUSES, index=0)
-        status_val = None if status == "(todos)" else status
+    tab1, tab2 = st.tabs(["📄 Relatórios", "✅ Resolvidas"])
 
-    floor_val = None
-    apt_val = None
-    code_val = None
-
-    if filter_mode == "Andar/Apto":
-        cA, cB = st.columns(2)
-        with cA:
-            floor_val = st.selectbox("Andar (filtro)", list(range(1, 13)), index=0)
-        with cB:
-            apt_val = st.selectbox("Apto (filtro)", list(range(1, 19)), index=0)
-        code_val = room_code(int(floor_val), int(apt_val))
-    elif filter_mode == "Código do quarto (ex: 0101)":
-        code_val = st.text_input("Quarto (4 dígitos)", placeholder="0101, 0218, 1203...").strip() or None
-
-    technician = st.text_input("Filtrar por responsável (contém)", placeholder="Ex: gabriel / joão / terceirizada")
-
-    if date_from > date_to:
-        st.error("A data 'De' não pode ser maior que a data 'Até'.")
-    else:
-        df = fetch_reports(date_from, date_to, floor_val, apt_val, code_val, technician, status_val)
-
-        st.markdown("### Resultado")
-        st.caption(f"{len(df)} linha(s) encontrada(s).")
-
-        if df.empty:
-            st.info("Nada encontrado com esses filtros.")
-        else:
-            show_cols = ["report_date", "room_code", "floor", "apt", "technician", "item", "status", "note", "created_at", "report_id"]
-            st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
-
-            csv = df[show_cols].to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Baixar CSV",
-                data=csv,
-                file_name=f"relatorio_manutencao_{date_from.isoformat()}_a_{date_to.isoformat()}.csv",
-                mime="text/csv"
+    # -----------------------------
+    # TAB 1 - RELATÓRIOS (igual ao seu, só que dentro do tab1)
+    # -----------------------------
+    with tab1:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            date_from = st.date_input("De", value=date.today(), key="rep_de")
+        with col2:
+            date_to = st.date_input("Até", value=date.today(), key="rep_ate")
+        with col3:
+            filter_mode = st.selectbox(
+                "Filtrar por",
+                ["(nenhum)", "Andar/Apto", "Código do quarto (ex: 0101)"],
+                index=0,
+                key="rep_filter_mode"
             )
+        with col4:
+            status = st.selectbox("Status do item", ["(todos)"] + STATUSES, index=0, key="rep_status")
+            status_val = None if status == "(todos)" else status
 
+        floor_val = None
+        apt_val = None
+        code_val = None
+
+        if filter_mode == "Andar/Apto":
+            cA, cB = st.columns(2)
+            with cA:
+                floor_val = st.selectbox("Andar (filtro)", list(range(1, 13)), index=0, key="rep_floor")
+            with cB:
+                apt_val = st.selectbox("Apto (filtro)", list(range(1, 19)), index=0, key="rep_apt")
+            code_val = room_code(int(floor_val), int(apt_val))
+
+        elif filter_mode == "Código do quarto (ex: 0101)":
+            code_val = st.text_input(
+                "Quarto (4 dígitos)",
+                placeholder="0101, 0218, 1203...",
+                key="rep_roomcode"
+            ).strip() or None
+
+        technician = st.text_input(
+            "Filtrar por responsável (contém)",
+            placeholder="Ex: gabriel / joão / terceirizada",
+            key="rep_tech"
+        )
+
+        if date_from > date_to:
+            st.error("A data 'De' não pode ser maior que a data 'Até'.")
+        else:
+            df = fetch_reports(date_from, date_to, floor_val, apt_val, code_val, technician, status_val)
+
+            st.markdown("### Resultado")
+            st.caption(f"{len(df)} linha(s) encontrada(s).")
+
+            if df.empty:
+                st.info("Nada encontrado com esses filtros.")
+            else:
+                show_cols = ["report_date", "room_code", "floor", "apt", "technician", "item", "status", "note", "created_at", "report_id"]
+                st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
+                csv = df[show_cols].to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Baixar CSV",
+                    data=csv,
+                    file_name=f"relatorio_manutencao_{date_from.isoformat()}_a_{date_to.isoformat()}.csv",
+                    mime="text/csv",
+                    key="rep_csv"
+                )
+
+    # -----------------------------
+    # TAB 2 - RESOLVIDAS
+    # -----------------------------
+    with tab2:
+        st.markdown("### Pendências resolvidas (quando, quem e o que foi feito)")
+
+        colA, colB, colC = st.columns(3)
+        with colA:
+            date_from_r = st.date_input("De (data do relatório)", value=date.today(), key="res_de")
+        with colB:
+            date_to_r = st.date_input("Até (data do relatório)", value=date.today(), key="res_ate")
+        with colC:
+            floor_filter_r = st.checkbox("Filtrar por andar", value=False, key="res_floor_chk")
+
+        floor_val_r = None
+        if floor_filter_r:
+            floor_val_r = st.selectbox("Andar", list(range(1, 13)), index=0, key="res_floor")
+
+        if date_from_r > date_to_r:
+            st.error("A data 'De' não pode ser maior que a data 'Até'.")
+        else:
+            df_res = fetch_resolved(date_from_r, date_to_r, floor_val_r)
+
+            if df_res.empty:
+                st.info("Nenhuma pendência resolvida nesse período.")
+            else:
+                st.success(f"{len(df_res)} pendência(s) resolvida(s) encontrada(s).")
+
+                show_cols_res = [
+                    "report_date", "room_code", "floor", "apt",
+                    "item", "note",
+                    "resolved_at", "resolved_by", "resolution_note",
+                    "technician", "report_id"
+                ]
+                st.dataframe(df_res[show_cols_res], use_container_width=True, hide_index=True)
+
+                csv_res = df_res[show_cols_res].to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Baixar CSV (Resolvidas)",
+                    data=csv_res,
+                    file_name=f"pendencias_resolvidas_{date_from_r.isoformat()}_a_{date_to_r.isoformat()}.csv",
+                    mime="text/csv",
+                    key="res_csv"
+                )
+                
 elif menu == "Pendências":
     st.subheader("Pendências (itens com PROBLEMA)")
 
@@ -536,25 +705,67 @@ elif menu == "Pendências":
 
     if date_from > date_to:
         st.error("A data 'De' não pode ser maior que a data 'Até'.")
-    else:
-        df = fetch_reports(date_from, date_to, floor_val, None, None, technician=None, status="Problema")
+        st.stop()
 
-        if df.empty:
-            st.success("Nenhuma pendência nesse período ✅")
-        else:
-            st.warning(f"{len(df)} pendência(s) encontrada(s).")
+    # ✅ agora busca só pendências ABERTAS (não resolvidas)
+    df = fetch_pendencies_open(date_from, date_to, floor_val)
 
-            show_cols = ["report_date", "room_code", "floor", "apt", "technician", "item", "status", "note", "created_at", "report_id"]
-            st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+    if df.empty:
+        st.success("Nenhuma pendência nesse período ✅")
+        st.stop()
 
-            st.markdown("### Resumo por quarto")
-            resumo = (
-                df.groupby(["report_date", "room_code"])
-                  .size()
-                  .reset_index(name="qtd_pendencias")
-                  .sort_values(["report_date", "room_code"], ascending=[False, True])
+    st.warning(f"{len(df)} pendência(s) aberta(s) encontrada(s).")
+
+    show_cols = ["report_date", "room_code", "floor", "apt", "technician", "item", "note", "created_at", "report_id"]
+    st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("## ✅ Resolver pendência")
+
+    resolved_by = st.text_input("Quem resolveu?", placeholder="Ex: Gabriel / Manutenção / Terceirizada")
+
+    st.caption("Abra uma pendência abaixo, descreva o que foi feito e marque como resolvida.")
+
+    for _, row in df.iterrows():
+        report_item_id = int(row["report_item_id"])
+        room_code_val = row["room_code"]
+        item_name = row["item"]
+        rep_date = row["report_date"]
+        note = row["note"]
+
+        with st.expander(f"🏷️ {rep_date} • Quarto {room_code_val} • {item_name}", expanded=False):
+            st.write(f"**Registrado por:** {row['technician']}")
+            st.write(f"**Observação do problema:** {note or '-'}")
+
+            resolution_note = st.text_area(
+                "O que foi feito para resolver?",
+                key=f"resolution_{report_item_id}",
+                placeholder="Ex: trocado cabo / resetado aparelho / substituída peça..."
             )
-            st.dataframe(resumo, use_container_width=True, hide_index=True)
+
+            colA, colB = st.columns([1, 3])
+            with colA:
+                if st.button("✅ Marcar como resolvida", type="primary", key=f"btn_resolve_{report_item_id}"):
+                    if not resolved_by.strip():
+                        st.error("Informe quem resolveu.")
+                        st.stop()
+
+                    resolve_pendency(report_item_id, resolved_by, resolution_note)
+                    st.success("Pendência marcada como resolvida! ✅")
+                    st.rerun()
+
+            with colB:
+                st.caption("Ao resolver, a pendência sai da lista (mas fica registrada no histórico).")
+
+    st.markdown("---")
+    st.markdown("### Resumo por quarto (pendências abertas)")
+    resumo = (
+        df.groupby(["report_date", "room_code"])
+          .size()
+          .reset_index(name="qtd_pendencias")
+          .sort_values(["report_date", "room_code"], ascending=[False, True])
+    )
+    st.dataframe(resumo, use_container_width=True, hide_index=True)
 
 elif menu == "Itens":
     st.subheader("Cadastro de Itens de Manutenção")
