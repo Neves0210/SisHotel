@@ -2,45 +2,41 @@ import os
 import shutil
 import sqlite3
 from datetime import date, datetime
+
 import pandas as pd
 import streamlit as st
+
 
 # ----------------------------
 # CONFIG
 # ----------------------------
 st.set_page_config(page_title="Hotel - Manutenção Diária", page_icon="🛠️", layout="wide")
 
-ITEMS = [
-    "Fechadura Porta (Pilhas)",
-    "Cofre",
-    "Frigobar",
-    "Toalheiro",
-    "Suporte Papel",
-    "Ducha",
-    "Luzes",
-    "Televisao",
-    "Telefone",
-    "Abajur",
-    "Tomadas",
-    "Controles",
-    "Cortina",
-]
-
+DB_PATH = "manutencao_hotel.db"
 STATUSES = ["OK", "Problema", "N/A"]
 
-DB_PATH = "manutencao_hotel.db"
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def room_code(floor: int, apt: int) -> str:
+    return f"{floor:02d}{apt:02d}"
+
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 # ----------------------------
 # MIGRATIONS (produção)
 # ----------------------------
-CURRENT_SCHEMA_VERSION = 2  # aumente quando mudar o schema
-
 def backup_db():
     if not os.path.exists(DB_PATH):
         return
     os.makedirs("backups", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     shutil.copy2(DB_PATH, f"backups/manutencao_hotel_{ts}.db")
+
 
 def ensure_schema_meta(cur):
     cur.execute("""
@@ -51,22 +47,31 @@ def ensure_schema_meta(cur):
     """)
     cur.execute("INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, 1);")
 
+
 def get_schema_version(cur) -> int:
     cur.execute("SELECT version FROM schema_meta WHERE id = 1;")
     return int(cur.fetchone()[0])
 
+
 def set_schema_version(cur, v: int):
     cur.execute("UPDATE schema_meta SET version = ? WHERE id = 1;", (v,))
+
 
 def table_has_column(cur, table: str, column: str) -> bool:
     cur.execute(f"PRAGMA table_info({table});")
     return any(row[1] == column for row in cur.fetchall())
 
+
 def migrate_if_needed(cur):
+    """
+    v1: reports com 'room' (1..216) e report_items com 'item' texto
+    v2: adiciona floor, apt, room_code e converte room -> floor/apt/room_code
+    v3: cria maintenance_items e adiciona item_id no report_items (itens cadastráveis)
+    """
     ensure_schema_meta(cur)
     v = get_schema_version(cur)
 
-    # v1 -> v2: adiciona floor/apt/room_code e converte a coluna antiga "room" (1..216)
+    # --- v1 -> v2
     if v < 2:
         if not table_has_column(cur, "reports", "floor"):
             cur.execute("ALTER TABLE reports ADD COLUMN floor INTEGER;")
@@ -75,7 +80,6 @@ def migrate_if_needed(cur):
         if not table_has_column(cur, "reports", "room_code"):
             cur.execute("ALTER TABLE reports ADD COLUMN room_code TEXT;")
 
-        # Se existia "room", converte
         if table_has_column(cur, "reports", "room"):
             cur.execute("""
                 UPDATE reports
@@ -90,33 +94,76 @@ def migrate_if_needed(cur):
                 WHERE room_code IS NULL OR room_code = '';
             """)
 
-        # Índices novos
         cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_roomcode ON reports(room_code);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_floor_apt ON reports(floor, apt);")
 
         set_schema_version(cur, 2)
+        v = 2
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-def room_code(floor: int, apt: int) -> str:
-    # 0101 = 1º andar apto 01
-    return f"{floor:02d}{apt:02d}"
+    # --- v2 -> v3 (itens cadastráveis)
+    if v < 3:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+        """)
+
+        if not table_has_column(cur, "report_items", "item_id"):
+            cur.execute("ALTER TABLE report_items ADD COLUMN item_id INTEGER;")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_items_active ON maintenance_items(active);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_report_items_item_id ON report_items(item_id);")
+
+        set_schema_version(cur, 3)
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def seed_default_items_if_empty():
+    defaults = [
+        "Fechadura Porta (Pilhas)",
+        "Cofre",
+        "Frigobar",
+        "Toalheiro",
+        "Suporte Papel",
+        "Ducha",
+        "Luzes",
+        "Televisao",
+        "Telefone",
+        "Abajur",
+        "Tomadas",
+        "Controles",
+        "Cortina",
+    ]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM maintenance_items;")
+    count = cur.fetchone()[0]
+
+    if count == 0:
+        now = datetime.now().isoformat(timespec="seconds")
+        cur.executemany(
+            "INSERT INTO maintenance_items (name, active, created_at) VALUES (?, 1, ?)",
+            [(d, now) for d in defaults]
+        )
+    conn.commit()
+    conn.close()
 
 
 def init_db():
-    # Em produção: sempre backup antes de migrar
     backup_db()
 
     conn = get_conn()
     cur = conn.cursor()
 
-    # Cria tabelas se não existirem (deixa colunas antigas opcionais para migração)
+    # Recomendo (melhora concorrência)
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+
+    # reports: mantém colunas antigas opcionais pra migração e compatibilidade
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,12 +171,10 @@ def init_db():
             technician TEXT NOT NULL,
             created_at TEXT NOT NULL,
 
-            -- novo schema
             floor INTEGER,
             apt INTEGER,
             room_code TEXT,
 
-            -- antigo schema (pode existir em bancos antigos)
             room INTEGER
         );
     """)
@@ -138,6 +183,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS report_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             report_id INTEGER NOT NULL,
+            item_id INTEGER,
             item TEXT NOT NULL,
             status TEXT NOT NULL,
             note TEXT,
@@ -145,12 +191,75 @@ def init_db():
         );
     """)
 
-    # Roda migração se precisar
     migrate_if_needed(cur)
 
     conn.commit()
     conn.close()
 
+    # seed inicial (se não tiver nenhum item cadastrado ainda)
+    seed_default_items_if_empty()
+
+
+# ----------------------------
+# CRUD ITENS
+# ----------------------------
+def list_items(active_only: bool = True) -> pd.DataFrame:
+    conn = get_conn()
+    q = "SELECT id, name, active, created_at FROM maintenance_items"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY name ASC;"
+    df = pd.read_sql_query(q, conn)
+    conn.close()
+    return df
+
+
+def normalize_item_name(name: str) -> str:
+    # remove espaços extras e padroniza
+    return " ".join(name.strip().split())
+
+
+def item_exists(name: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1 FROM maintenance_items
+        WHERE name = ?
+        COLLATE NOCASE
+        LIMIT 1;
+    """, (name,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def add_item(name: str):
+    name = normalize_item_name(name)
+
+    if item_exists(name):
+        raise ValueError("Item já cadastrado.")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO maintenance_items (name, active, created_at)
+        VALUES (?, 1, ?)
+    """, (name, datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+
+
+def set_item_active(item_id: int, active: bool):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE maintenance_items SET active = ? WHERE id = ?", (1 if active else 0, item_id))
+    conn.commit()
+    conn.close()
+
+
+# ----------------------------
+# CRUD RELATÓRIOS
+# ----------------------------
 def insert_report(report_date: date, floor: int, apt: int, technician: str, items_payload: list[dict]):
     conn = get_conn()
     cur = conn.cursor()
@@ -172,10 +281,10 @@ def insert_report(report_date: date, floor: int, apt: int, technician: str, item
     report_id = cur.lastrowid
 
     cur.executemany("""
-        INSERT INTO report_items (report_id, item, status, note)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO report_items (report_id, item_id, item, status, note)
+        VALUES (?, ?, ?, ?, ?)
     """, [
-        (report_id, row["item"], row["status"], row.get("note", "").strip() or None)
+        (report_id, row["item_id"], row["item"], row["status"], row.get("note", "").strip() or None)
         for row in items_payload
     ])
 
@@ -203,11 +312,12 @@ def fetch_reports(
             r.room_code,
             r.technician,
             r.created_at,
-            ri.item,
+            COALESCE(mi.name, ri.item) AS item,
             ri.status,
             COALESCE(ri.note, '') AS note
         FROM reports r
         JOIN report_items ri ON ri.report_id = r.id
+        LEFT JOIN maintenance_items mi ON mi.id = ri.item_id
         WHERE r.report_date BETWEEN ? AND ?
     """
     params = [date_from.isoformat(), date_to.isoformat()]
@@ -246,7 +356,7 @@ init_db()
 
 st.title("🛠️ Relatório Diário de Manutenção - Hotel (12 andares x 18 aptos)")
 
-menu = st.sidebar.radio("Navegação", ["Registrar manutenção", "Relatórios", "Pendências"])
+menu = st.sidebar.radio("Navegação", ["Registrar manutenção", "Relatórios", "Pendências", "Itens"])
 st.sidebar.markdown("---")
 st.sidebar.caption("Dados salvos localmente em SQLite (manutencao_hotel.db).")
 
@@ -266,36 +376,44 @@ if menu == "Registrar manutenção":
 
     technician = st.text_input("Responsável / Técnico", placeholder="Ex: Gabriel / Manutenção")
 
-    st.markdown("### Checklist dos itens")
-    st.caption("Use N/A quando não se aplica. Marque Problema para gerar pendências.")
+    items_df = list_items(active_only=True)
+    if items_df.empty:
+        st.warning("Nenhum item ativo cadastrado. Vá em 'Itens' e cadastre/ative os itens.")
+    else:
+        st.markdown("### Checklist dos itens")
+        st.caption("Use N/A quando não se aplica. Marque Problema para gerar pendências.")
 
-    items_payload = []
-    for item in ITEMS:
-        with st.container(border=True):
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                status = st.selectbox(item, STATUSES, index=0, key=f"status_{item}")
-            with c2:
-                note = st.text_input(
-                    "Observação (opcional)",
-                    key=f"note_{item}",
-                    placeholder="Ex: pilhas fracas / troca solicitada / peça quebrada"
-                )
-        items_payload.append({"item": item, "status": status, "note": note})
+        items_payload = []
+        for _, row in items_df.iterrows():
+            item_id = int(row["id"])
+            item_name = row["name"]
 
-    st.markdown("---")
-    colS1, colS2 = st.columns([1, 3])
-    with colS1:
-        save = st.button("💾 Salvar relatório", type="primary")
-    with colS2:
-        st.caption("Cada item vira uma linha no relatório (facilita filtro e pendências).")
+            with st.container(border=True):
+                c1, c2 = st.columns([1, 2])
+                with c1:
+                    status = st.selectbox(item_name, STATUSES, index=0, key=f"status_{item_id}")
+                with c2:
+                    note = st.text_input(
+                        "Observação (opcional)",
+                        key=f"note_{item_id}",
+                        placeholder="Ex: pilhas fracas / troca solicitada / peça quebrada"
+                    )
 
-    if save:
-        if not technician.strip():
-            st.error("Informe o nome do responsável/técnico.")
-        else:
-            insert_report(report_date, int(floor), int(apt), technician, items_payload)
-            st.success(f"Relatório salvo! ✅ (Quarto {code} - {report_date.strftime('%d/%m/%Y')})")
+            items_payload.append({"item_id": item_id, "item": item_name, "status": status, "note": note})
+
+        st.markdown("---")
+        colS1, colS2 = st.columns([1, 3])
+        with colS1:
+            save = st.button("💾 Salvar relatório", type="primary")
+        with colS2:
+            st.caption("Cada item vira uma linha no relatório (facilita filtro e pendências).")
+
+        if save:
+            if not technician.strip():
+                st.error("Informe o nome do responsável/técnico.")
+            else:
+                insert_report(report_date, int(floor), int(apt), technician, items_payload)
+                st.success(f"Relatório salvo! ✅ (Quarto {code} - {report_date.strftime('%d/%m/%Y')})")
 
 elif menu == "Relatórios":
     st.subheader("Relatórios e exportação")
@@ -305,10 +423,8 @@ elif menu == "Relatórios":
         date_from = st.date_input("De", value=date.today())
     with col2:
         date_to = st.date_input("Até", value=date.today())
-
     with col3:
         filter_mode = st.selectbox("Filtrar por", ["(nenhum)", "Andar/Apto", "Código do quarto (ex: 0101)"], index=0)
-
     with col4:
         status = st.selectbox("Status do item", ["(todos)"] + STATUSES, index=0)
         status_val = None if status == "(todos)" else status
@@ -324,7 +440,6 @@ elif menu == "Relatórios":
         with cB:
             apt_val = st.selectbox("Apto (filtro)", list(range(1, 19)), index=0)
         code_val = room_code(int(floor_val), int(apt_val))
-
     elif filter_mode == "Código do quarto (ex: 0101)":
         code_val = st.text_input("Quarto (4 dígitos)", placeholder="0101, 0218, 1203...").strip() or None
 
@@ -388,3 +503,49 @@ elif menu == "Pendências":
                   .sort_values(["report_date", "room_code"], ascending=[False, True])
             )
             st.dataframe(resumo, use_container_width=True, hide_index=True)
+
+elif menu == "Itens":
+    st.subheader("Cadastro de Itens de Manutenção")
+
+    with st.expander("➕ Adicionar novo item", expanded=True):
+        new_name = st.text_input("Nome do item", placeholder="Ex: Ar-condicionado / Interfone / Fechadura Banheiro")
+        if st.button("Adicionar", type="primary"):
+            if not new_name.strip():
+                st.error("Digite um nome.")
+            else:
+                try:
+                    add_item(new_name)
+                    st.success("Item cadastrado!")
+                    st.rerun()
+                except ValueError as e:
+                    st.warning(str(e))
+                except sqlite3.IntegrityError:
+                    st.warning("Esse item já existe.")
+
+    st.markdown("### Itens cadastrados")
+    items_all = list_items(active_only=False)
+
+    if items_all.empty:
+        st.info("Nenhum item cadastrado ainda.")
+    else:
+        # Ajusta ativo para bool na visualização
+        view_df = items_all.copy()
+        view_df["active"] = view_df["active"].apply(lambda x: "Sim" if int(x) == 1 else "Não")
+        st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Ativar / Desativar itens")
+        st.caption("Desativar não apaga histórico; só remove do checklist novo.")
+
+        for _, r in items_all.iterrows():
+            item_id = int(r["id"])
+            name = r["name"]
+            active = bool(r["active"])
+
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.write(name)
+            with col2:
+                new_active = st.toggle("Ativo", value=active, key=f"active_{item_id}")
+                if new_active != active:
+                    set_item_active(item_id, new_active)
+                    st.rerun()
