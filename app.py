@@ -698,7 +698,7 @@ init_db()
 
 st.title("🛠️ Relatório Diário de Manutenção - Hotel")
 
-menu = st.sidebar.radio("Navegação", ["Dashboard", "Registrar manutenção", "Manutenção Geral", "Relatórios", "Pendências"])
+menu = st.sidebar.radio("Navegação", ["Dashboard", "Registrar manutenção", "Manutenção Geral", "Relatórios", "Pendências", "Itens"])
 st.sidebar.markdown("---")
 st.sidebar.caption("Dados salvos localmente em SQLite (manutencao_hotel.db).")
 
