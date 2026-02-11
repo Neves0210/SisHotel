@@ -175,7 +175,6 @@ def fetch_general_maintenance(date_from: date, date_to: date, status: str | None
     conn.close()
     return df
 
-
 def resolve_general_maintenance(gm_id: int, resolved_by: str, resolution_note: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -197,6 +196,137 @@ def resolve_general_maintenance(gm_id: int, resolved_by: str, resolution_note: s
 
     conn.commit()
     conn.close()
+
+def fetch_open_pendencies_apts(date_from: date, date_to: date, floor: int | None = None):
+    """
+    Pendências = itens com status 'Problema' em report_items
+    (não resolvidos ainda)
+    """
+    conn = get_conn()
+    q = """
+        SELECT
+            r.report_date,
+            r.room_code,
+            r.floor,
+            r.apt,
+            r.technician,
+            ri.item,
+            ri.status,
+            COALESCE(ri.note, '') AS note,
+            r.created_at,
+            r.id AS report_id
+        FROM reports r
+        JOIN report_items ri ON ri.report_id = r.id
+        WHERE r.report_date BETWEEN ? AND ?
+          AND ri.status = 'Problema'
+          AND (ri.resolved_at IS NULL OR ri.resolved_at = '')
+    """
+    params = [date_from.isoformat(), date_to.isoformat()]
+
+    if floor is not None:
+        q += " AND r.floor = ?"
+        params.append(int(floor))
+
+    q += " ORDER BY r.report_date DESC, r.room_code ASC;"
+
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+
+def dashboard_counts(date_from: date, date_to: date, floor: int | None = None):
+    # APTOS: pendências abertas
+    df_pend_open = fetch_open_pendencies_apts(date_from, date_to, floor)
+
+    # APTOS: resolvidas (usa sua função existente)
+    df_res = fetch_resolved(date_from, date_to, floor)
+
+    # GERAL: pega tudo e conta por status
+    df_gm = fetch_general_maintenance(date_from, date_to, status=None, search=None)
+
+    pendencias = len(df_pend_open)
+
+    # "Em andamento" vem da manutenção geral
+    em_andamento = 0
+    if not df_gm.empty:
+        em_andamento = int((df_gm["status"] == "Em andamento").sum())
+
+    # Concluídas = resolvidas aptos + gerais resolvidas
+    concluidas = len(df_res)
+    if not df_gm.empty:
+        concluidas += int((df_gm["status"] == "Resolvido").sum())
+
+    # "Abertas" gerais entram em pendências gerais (se quiser somar também)
+    gerais_abertas = 0
+    if not df_gm.empty:
+        gerais_abertas = int((df_gm["status"] == "Aberto").sum())
+
+    return {
+        "pendencias_apts_abertas": pendencias,
+        "gerais_abertas": gerais_abertas,
+        "em_andamento": em_andamento,
+        "concluidas": concluidas,
+        "df_pend_open": df_pend_open,
+        "df_res": df_res,
+        "df_gm": df_gm,
+    }
+
+
+def items_to_verify_by_room(date_from: date, date_to: date, floor: int | None = None):
+    """
+    Itens a verificar por quarto = itens ativos cadastrados - itens vistoriados no período.
+    Usa a lista de itens ativos e o fetch_reports do período.
+    """
+    items_df = list_items(active_only=True)
+    all_items = set(items_df["name"].astype(str).tolist()) if not items_df.empty else set()
+
+    # se não tem itens cadastrados, retorna vazio
+    if not all_items:
+        return pd.DataFrame(columns=["room_code", "qtd_faltando", "itens_faltando"])
+
+    df = fetch_reports(date_from, date_to, floor, None, None, technician=None, status=None)
+
+    # df tem item = nome do item
+    if df.empty:
+        # ninguém vistoriou nada no período
+        rooms = []
+        # gera lista de quartos conforme filtro
+        floors = [floor] if floor else list(range(1, 13))
+        for f in floors:
+            for a in range(1, 19):
+                rooms.append(room_code(int(f), int(a)))
+        return pd.DataFrame([{
+            "room_code": rc,
+            "qtd_faltando": len(all_items),
+            "itens_faltando": ", ".join(sorted(all_items))
+        } for rc in rooms]).sort_values(["room_code"])
+
+    # itens vistoriados por quarto
+    checked = (
+        df.groupby("room_code")["item"]
+          .apply(lambda s: set([str(x) for x in s.tolist()]))
+          .to_dict()
+    )
+
+    # gera todos os quartos (para não sumir quarto sem registro)
+    rooms = []
+    floors = [floor] if floor else list(range(1, 13))
+    for f in floors:
+        for a in range(1, 19):
+            rooms.append(room_code(int(f), int(a)))
+
+    rows = []
+    for rc in rooms:
+        done = checked.get(rc, set())
+        missing = sorted(list(all_items - done))
+        rows.append({
+            "room_code": rc,
+            "qtd_faltando": len(missing),
+            "itens_faltando": ", ".join(missing)
+        })
+
+    out = pd.DataFrame(rows).sort_values(["qtd_faltando", "room_code"], ascending=[False, True])
+    return out
 
 def export_unified_xlsx(df_apts: pd.DataFrame, df_resolved: pd.DataFrame, df_general: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -568,11 +698,67 @@ init_db()
 
 st.title("🛠️ Relatório Diário de Manutenção - Hotel")
 
-menu = st.sidebar.radio("Navegação", ["Registrar manutenção", "Manutenção Geral", "Relatórios", "Pendências", "Itens"])
+menu = st.sidebar.radio("Navegação", ["Dashboard", "Registrar manutenção", "Manutenção Geral", "Relatórios", "Pendências"])
 st.sidebar.markdown("---")
 st.sidebar.caption("Dados salvos localmente em SQLite (manutencao_hotel.db).")
 
-if menu == "Registrar manutenção":
+if menu == "Dashboard":
+    st.title("📊 Dashboard Geral")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        d_from = st.date_input("De", value=date.today(), key="dash_from")
+    with c2:
+        d_to = st.date_input("Até", value=date.today(), key="dash_to")
+    with c3:
+        floor_chk = st.checkbox("Filtrar por andar", value=False, key="dash_floor_chk")
+    with c4:
+        floor_val = None
+        if floor_chk:
+            floor_val = st.selectbox("Andar", list(range(1, 13)), index=0, key="dash_floor")
+
+    if d_from > d_to:
+        st.error("A data 'De' não pode ser maior que a data 'Até'.")
+        st.stop()
+
+    data = dashboard_counts(d_from, d_to, floor_val)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("🚨 Pendências Aptos (abertas)", data["pendencias_apts_abertas"])
+    k2.metric("🧰 Manutenção Geral (abertas)", data["gerais_abertas"])
+    k3.metric("⏳ Em andamento (Geral)", data["em_andamento"])
+    k4.metric("✅ Concluídas (Aptos + Geral)", data["concluidas"])
+
+    st.markdown("---")
+
+    tabA, tabB, tabC = st.tabs(["🚨 Pendências abertas (Aptos)", "✅ Resolvidas (Aptos)", "🧰 Manutenção Geral"])
+
+    with tabA:
+        df_p = data["df_pend_open"]
+        if df_p.empty:
+            st.success("Nenhuma pendência aberta nos aptos ✅")
+        else:
+            st.warning(f"{len(df_p)} pendência(s) aberta(s).")
+            cols = ["report_date", "room_code", "floor", "apt", "item", "note", "technician", "created_at", "report_id"]
+            st.dataframe(df_p[cols], use_container_width=True, hide_index=True)
+
+    with tabB:
+        df_r = data["df_res"]
+        if df_r.empty:
+            st.info("Nenhuma pendência resolvida no período.")
+        else:
+            cols = ["report_date", "room_code", "floor", "apt", "item", "note", "resolved_at", "resolved_by", "resolution_note", "technician", "report_id"]
+            st.dataframe(df_r[cols], use_container_width=True, hide_index=True)
+
+    with tabC:
+        df_gm = data["df_gm"]
+        if df_gm.empty:
+            st.info("Nenhum registro de manutenção geral no período.")
+        else:
+            cols = ["maint_date", "place", "description", "status", "technician", "note", "resolved_at", "resolved_by", "resolution_note", "created_at", "id"]
+            st.dataframe(df_gm[cols], use_container_width=True, hide_index=True)
+
+elif menu == "Registrar manutenção":
     st.subheader("Registrar manutenção do dia")
 
     if "reset_token" not in st.session_state:
@@ -891,7 +1077,7 @@ elif menu == "Relatórios":
                 )
 
                 st.markdown("---")
-                
+
 elif menu == "Manutenção Geral":
     st.subheader("🧰 Manutenção Geral (fora dos apartamentos)")
 
