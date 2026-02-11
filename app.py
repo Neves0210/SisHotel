@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
-
+import io
 
 # ----------------------------
 # CONFIG
@@ -21,7 +21,6 @@ STATUSES = ["OK", "Problema", "N/A"]
 # ----------------------------
 def room_code(floor: int, apt: int) -> str:
     return f"{floor:02d}{apt:02d}"
-
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -198,6 +197,15 @@ def resolve_general_maintenance(gm_id: int, resolved_by: str, resolution_note: s
 
     conn.commit()
     conn.close()
+
+def export_unified_xlsx(df_apts: pd.DataFrame, df_resolved: pd.DataFrame, df_general: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Garantir que sempre exista a aba, mesmo vazia
+        (df_apts if not df_apts.empty else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Aptos")
+        (df_resolved if not df_resolved.empty else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Resolvidas Aptos")
+        (df_general if not df_general.empty else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Manutenção Geral")
+    return output.getvalue()
 
 # ----------------------------
 # MIGRATIONS (produção)
@@ -673,6 +681,52 @@ if menu == "Registrar manutenção":
 
 elif menu == "Relatórios":
     st.subheader("Relatórios e exportação")
+    st.markdown("## 📦 Exportação Unificada (tudo em 1 arquivo)")
+
+    colU1, colU2, colU3 = st.columns(3)
+    with colU1:
+        uni_from = st.date_input("De (unificado)", value=date.today(), key="uni_from")
+    with colU2:
+        uni_to = st.date_input("Até (unificado)", value=date.today(), key="uni_to")
+    with colU3:
+        uni_floor_chk = st.checkbox("Filtrar por andar (apts)", value=False, key="uni_floor_chk")
+
+    uni_floor = None
+    if uni_floor_chk:
+        uni_floor = st.selectbox("Andar", list(range(1, 13)), index=0, key="uni_floor")
+
+    if uni_from > uni_to:
+        st.error("A data 'De' não pode ser maior que a data 'Até'.")
+    else:
+        # 1) Aptos (todos os status)
+        df_apts_uni = fetch_reports(uni_from, uni_to, uni_floor, None, None, technician=None, status=None)
+
+        # 2) Resolvidas aptos
+        df_res_uni = fetch_resolved(uni_from, uni_to, uni_floor)
+
+        # 3) Manutenção geral
+        df_gm_uni = fetch_general_maintenance(uni_from, uni_to, status=None, search=None)
+
+        # Colunas (padronizar para export)
+        cols_apts = ["report_date","room_code","floor","apt","technician","item","status","note","created_at","report_id"]
+        cols_res = ["report_date","room_code","floor","apt","item","note","resolved_at","resolved_by","resolution_note","technician","report_id"]
+        cols_gm = ["maint_date","place","description","status","technician","note","resolved_at","resolved_by","resolution_note","created_at","id"]
+
+        df_apts_uni = df_apts_uni[cols_apts] if not df_apts_uni.empty else pd.DataFrame(columns=cols_apts)
+        df_res_uni = df_res_uni[cols_res] if not df_res_uni.empty else pd.DataFrame(columns=cols_res)
+        df_gm_uni = df_gm_uni[cols_gm] if not df_gm_uni.empty else pd.DataFrame(columns=cols_gm)
+
+        xlsx_bytes = export_unified_xlsx(df_apts_uni, df_res_uni, df_gm_uni)
+
+        st.download_button(
+            "⬇️ Baixar Excel Unificado",
+            data=xlsx_bytes,
+            file_name=f"relatorio_unificado_{uni_from.isoformat()}_a_{uni_to.isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="uni_xlsx"
+        )
+
+    st.markdown("---")
 
     tab1, tab2, tab3 = st.tabs(["📄 Relatórios", "✅ Pendencias Resolvidas", "🧰 Manutenção Geral"])
 
@@ -837,33 +891,7 @@ elif menu == "Relatórios":
                 )
 
                 st.markdown("---")
-                st.markdown("### ✅ Resolver (opcional)")
-
-                resolved_by = st.text_input("Quem resolveu?", placeholder="Ex: Gabriel / Manutenção", key="rep_gm_res_by")
-
-                pend = df_gm[df_gm["status"] != "Resolvido"].copy()
-                if pend.empty:
-                    st.success("Nenhuma manutenção geral pendente ✅")
-                else:
-                    for _, row in pend.iterrows():
-                        gm_id = int(row["id"])
-                        title = f"{row['maint_date']} • {row['place']} • {row['status']}"
-                        with st.expander(title):
-                            st.write(f"**Descrição:** {row['description']}")
-                            st.write(f"**Registrado por:** {row['technician']}")
-                            if row["note"]:
-                                st.write(f"**Obs:** {row['note']}")
-
-                            res_note = st.text_area("O que foi feito?", key=f"rep_gm_res_note_{gm_id}")
-
-                            if st.button("✅ Marcar como resolvido", type="primary", key=f"rep_gm_btn_res_{gm_id}"):
-                                if not resolved_by.strip():
-                                    st.error("Informe quem resolveu.")
-                                    st.stop()
-                                resolve_general_maintenance(gm_id, resolved_by, res_note)
-                                st.success("Marcado como resolvido! ✅")
-                                st.rerun()
-
+                
 elif menu == "Manutenção Geral":
     st.subheader("🧰 Manutenção Geral (fora dos apartamentos)")
 
