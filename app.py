@@ -371,6 +371,129 @@ def cleanup_empty_report(report_id: int):
 
     conn.close()
 
+def fetch_daily_summary(target_date: date, floor: int | None = None):
+    """
+    Retorna 1 linha por quarto, com resumo do que foi feito no dia:
+    - itens OK
+    - itens Problema
+    - observações (note)
+    - técnico
+    - hora (último lançamento)
+    """
+    df = fetch_reports(target_date, target_date, floor, None, None, technician=None, status=None)
+
+    base_cols = ["report_date", "room_code", "floor", "apt", "technician", "ok_items", "problem_items", "notes", "last_time"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    # garantir strings
+    df = df.copy()
+    df["item"] = df["item"].fillna("").astype(str)
+    df["note"] = df["note"].fillna("").astype(str)
+    df["status"] = df["status"].fillna("").astype(str)
+    df["created_at"] = df["created_at"].fillna("").astype(str)
+
+    def join_unique(values) -> str:
+        """
+        Recebe lista/iterável de valores e devolve texto:
+        - remove vazios
+        - remove duplicados mantendo ordem
+        """
+        cleaned = []
+        for v in values:
+            s = str(v).strip()
+            if s:
+                cleaned.append(s)
+
+        seen = set()
+        out = []
+        for s in cleaned:
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+
+        return ", ".join(out)
+
+    def summarize_group(g: pd.DataFrame) -> pd.Series:
+        ok_items = join_unique(g.loc[g["status"] == "OK", "item"].tolist())
+        prob_items = join_unique(g.loc[g["status"] == "Problema", "item"].tolist())
+        notes = join_unique(g["note"].tolist())
+        last_time = str(g["created_at"].max() if not g["created_at"].empty else "")
+
+        # deixa bonito
+        ok_items = ok_items if ok_items else "—"
+        prob_items = prob_items if prob_items else "—"
+        notes = notes if notes else "—"
+        last_time = last_time.replace("T", " ")[:16] if last_time else "—"
+
+        return pd.Series(
+            {
+                "ok_items": ok_items,
+                "problem_items": prob_items,
+                "notes": notes,
+                "last_time": last_time,
+            }
+        )
+
+    resumo = (
+        df.groupby(["report_date", "room_code", "floor", "apt", "technician"], as_index=False)
+          .apply(lambda g: summarize_group(g), include_groups=False)
+          .reset_index()
+    )
+
+    # Algumas versões do pandas criam colunas extras; garantimos só o necessário:
+    # (se aparecer uma coluna "level_0" ou "index", remove)
+    for c in ["level_0", "index"]:
+        if c in resumo.columns:
+            resumo = resumo.drop(columns=[c])
+
+    # ordena por quarto
+    if "floor" in resumo.columns and "apt" in resumo.columns:
+        resumo = resumo.sort_values(["floor", "apt", "room_code"], ascending=[True, True, True])
+    else:
+        resumo = resumo.sort_values(["room_code"], ascending=True)
+
+    # garante que existe tudo que o dashboard usa
+    for col in base_cols:
+        if col not in resumo.columns:
+            resumo[col] = "—"
+
+    # mantém apenas colunas esperadas
+    return resumo[base_cols]
+
+def fetch_general_daily_summary(target_date: date):
+    """
+    Retorna manutenções gerais do dia (fora dos apartamentos).
+    Espera que sua tabela/consulta de manutenção geral tenha:
+    maint_date, place, description, status, technician, note, created_at,
+    resolved_at, resolved_by, resolution_note, id
+    """
+    df = fetch_general_maintenance(target_date, target_date, status=None, search=None)
+
+    cols = [
+        "maint_date", "place", "description", "status",
+        "technician", "note",
+        "resolved_at", "resolved_by", "resolution_note",
+        "created_at", "id"
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+
+    # garante colunas e strings
+    df = df.copy()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    # deixa bonito (horário)
+    df["created_at"] = df["created_at"].fillna("").astype(str).str.replace("T", " ").str.slice(0, 16)
+    df["resolved_at"] = df["resolved_at"].fillna("").astype(str).str.replace("T", " ").str.slice(0, 16)
+
+    # ordena: mais recentes primeiro
+    df = df.sort_values(["maint_date", "created_at", "id"], ascending=[False, False, False])
+
+    return df[cols]
+
 # ----------------------------
 # MIGRATIONS (produção)
 # ----------------------------
@@ -737,61 +860,214 @@ menu = st.sidebar.radio("Navegação", ["Dashboard", "Registrar manutenção", "
 st.sidebar.markdown("---")
 st.sidebar.caption("Dados salvos localmente em SQLite (manutencao_hotel.db).")
 
+# if menu == "Dashboard":
+#     st.title("📊 Dashboard Geral")
+
+#     c1, c2, c3, c4 = st.columns(4)
+#     with c1:
+#         d_from = st.date_input("De", value=date.today(), key="dash_from")
+#     with c2:
+#         d_to = st.date_input("Até", value=date.today(), key="dash_to")
+#     with c3:
+#         floor_chk = st.checkbox("Filtrar por andar", value=False, key="dash_floor_chk")
+#     with c4:
+#         floor_val = None
+#         if floor_chk:
+#             floor_val = st.selectbox("Andar", list(range(1, 13)), index=0, key="dash_floor")
+
+#     if d_from > d_to:
+#         st.error("A data 'De' não pode ser maior que a data 'Até'.")
+#         st.stop()
+
+#     data = dashboard_counts(d_from, d_to, floor_val)
+
+#     k1, k2, k3, k4 = st.columns(4)
+#     k1.metric("🚨 Pendências Aptos (abertas)", data["pendencias_apts_abertas"])
+#     k2.metric("🧰 Manutenção Geral (abertas)", data["gerais_abertas"])
+#     k3.metric("⏳ Em andamento (Geral)", data["em_andamento"])
+#     k4.metric("✅ Concluídas (Aptos + Geral)", data["concluidas"])
+
+#     st.markdown("---")
+
+#     tabA, tabB, tabC = st.tabs(["🚨 Pendências abertas (Aptos)", "✅ Resolvidas (Aptos)", "🧰 Manutenção Geral"])
+
+#     with tabA:
+#         df_p = data["df_pend_open"]
+#         if df_p.empty:
+#             st.success("Nenhuma pendência aberta nos aptos ✅")
+#         else:
+#             st.warning(f"{len(df_p)} pendência(s) aberta(s).")
+#             cols = ["report_date", "room_code", "floor", "apt", "item", "note", "technician", "created_at", "report_id"]
+#             st.dataframe(df_p[cols], use_container_width=True, hide_index=True)
+
+#     with tabB:
+#         df_r = data["df_res"]
+#         if df_r.empty:
+#             st.info("Nenhuma pendência resolvida no período.")
+#         else:
+#             cols = ["report_date", "room_code", "floor", "apt", "item", "note", "resolved_at", "resolved_by", "resolution_note", "technician", "report_id"]
+#             st.dataframe(df_r[cols], use_container_width=True, hide_index=True)
+
+#     with tabC:
+#         df_gm = data["df_gm"]
+#         if df_gm.empty:
+#             st.info("Nenhum registro de manutenção geral no período.")
+#         else:
+#             cols = ["maint_date", "place", "description", "status", "technician", "note", "resolved_at", "resolved_by", "resolution_note", "created_at", "id"]
+#             st.dataframe(df_gm[cols], use_container_width=True, hide_index=True)
+
 if menu == "Dashboard":
-    st.title("📊 Dashboard Geral")
+    st.title("📊 Dashboard - Manutenções")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        d_from = st.date_input("De", value=date.today(), key="dash_from")
-    with c2:
-        d_to = st.date_input("Até", value=date.today(), key="dash_to")
-    with c3:
-        floor_chk = st.checkbox("Filtrar por andar", value=False, key="dash_floor_chk")
-    with c4:
-        floor_val = None
-        if floor_chk:
-            floor_val = st.selectbox("Andar", list(range(1, 13)), index=0, key="dash_floor")
+    colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
+    with colA:
+        day = st.date_input("Dia", value=date.today(), key="dash_day")
+    with colB:
+        floor_chk = st.checkbox("Filtrar por andar (apts)", value=False, key="dash_floor_chk")
+    with colC:
+        floor = st.selectbox("Andar", list(range(1, 13)), index=0, key="dash_floor") if floor_chk else None
+    with colD:
+        search = st.text_input(
+            "Buscar (quarto/local/item/técnico)",
+            placeholder="Ex: 0101 / recepção / frigobar / gabriel",
+            key="dash_search"
+        ).strip().lower()
 
-    if d_from > d_to:
-        st.error("A data 'De' não pode ser maior que a data 'Até'.")
-        st.stop()
+    # ---------
+    # Dados
+    # ---------
+    df_apts = fetch_daily_summary(day, floor)
+    df_gm = fetch_general_daily_summary(day)
 
-    data = dashboard_counts(d_from, d_to, floor_val)
+    # ---------
+    # Métricas (Aptos)
+    # ---------
+    total_quartos = int(df_apts["room_code"].nunique()) if not df_apts.empty else 0
+    quartos_com_pend = int((df_apts["problem_items"] != "—").sum()) if not df_apts.empty else 0
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("🚨 Pendências Aptos (abertas)", data["pendencias_apts_abertas"])
-    k2.metric("🧰 Manutenção Geral (abertas)", data["gerais_abertas"])
-    k3.metric("⏳ Em andamento (Geral)", data["em_andamento"])
-    k4.metric("✅ Concluídas (Aptos + Geral)", data["concluidas"])
+    # ---------
+    # Métricas (Geral)
+    # ---------
+    gm_total = int(len(df_gm)) if not df_gm.empty else 0
 
-    st.markdown("---")
+    # Se seu sistema usa status tipo "Resolvido", "Em andamento", "Pendente"
+    gm_resolvidas = int((df_gm["status"].astype(str).str.lower() == "resolvido").sum()) if not df_gm.empty else 0
+    gm_pendentes = gm_total - gm_resolvidas
 
-    tabA, tabB, tabC = st.tabs(["🚨 Pendências abertas (Aptos)", "✅ Resolvidas (Aptos)", "🧰 Manutenção Geral"])
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Quartos com registro (dia)", total_quartos)
+    m2.metric("Quartos com pendência (dia)", quartos_com_pend)
+    m3.metric("Manut. Geral (dia)", gm_total)
+    m4.metric("Geral pendentes (dia)", gm_pendentes)
 
+    tabA, tabG = st.tabs(["🏨 Aptos (dia)", "🧰 Manutenção Geral (dia)"])
+
+    # =========================
+    # TAB APTOS
+    # =========================
     with tabA:
-        df_p = data["df_pend_open"]
-        if df_p.empty:
-            st.success("Nenhuma pendência aberta nos aptos ✅")
+        if df_apts.empty:
+            st.info("Nenhum registro de apartamento para este dia.")
         else:
-            st.warning(f"{len(df_p)} pendência(s) aberta(s).")
-            cols = ["report_date", "room_code", "floor", "apt", "item", "note", "technician", "created_at", "report_id"]
-            st.dataframe(df_p[cols], use_container_width=True, hide_index=True)
+            # busca
+            if search:
+                mask = (
+                    df_apts["room_code"].astype(str).str.lower().str.contains(search)
+                    | df_apts["technician"].astype(str).str.lower().str.contains(search)
+                    | df_apts["ok_items"].astype(str).str.lower().str.contains(search)
+                    | df_apts["problem_items"].astype(str).str.lower().str.contains(search)
+                    | df_apts["notes"].astype(str).str.lower().str.contains(search)
+                )
+                df_show = df_apts[mask].copy()
+            else:
+                df_show = df_apts.copy()
 
-    with tabB:
-        df_r = data["df_res"]
-        if df_r.empty:
-            st.info("Nenhuma pendência resolvida no período.")
-        else:
-            cols = ["report_date", "room_code", "floor", "apt", "item", "note", "resolved_at", "resolved_by", "resolution_note", "technician", "report_id"]
-            st.dataframe(df_r[cols], use_container_width=True, hide_index=True)
+            st.markdown("### ✅ Resumo do dia (1 linha por quarto)")
+            df_show["room_status"] = df_show["problem_items"].apply(lambda x: "⚠️ Pendente" if x != "—" else "✅ OK")
 
-    with tabC:
-        df_gm = data["df_gm"]
+            show_cols = ["room_code", "room_status", "technician", "ok_items", "problem_items", "notes", "last_time"]
+
+            st.dataframe(
+                df_show[show_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "room_code": st.column_config.TextColumn("Quarto", width="small"),
+                    "room_status": st.column_config.TextColumn("Status", width="small"),
+                    "technician": st.column_config.TextColumn("Responsável", width="medium"),
+                    "ok_items": st.column_config.TextColumn("Itens OK", width="large"),
+                    "problem_items": st.column_config.TextColumn("Pendências", width="large"),
+                    "notes": st.column_config.TextColumn("Observações", width="large"),
+                    "last_time": st.column_config.TextColumn("Último horário", width="small"),
+                },
+            )
+
+            csv = df_show[show_cols].to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Baixar CSV (Aptos - dia)",
+                data=csv,
+                file_name=f"dashboard_apts_{day.isoformat()}.csv",
+                mime="text/csv",
+                key="dash_apts_csv"
+            )
+
+    # =========================
+    # TAB MANUTENÇÃO GERAL
+    # =========================
+    with tabG:
         if df_gm.empty:
-            st.info("Nenhum registro de manutenção geral no período.")
+            st.info("Nenhuma manutenção geral registrada neste dia.")
         else:
-            cols = ["maint_date", "place", "description", "status", "technician", "note", "resolved_at", "resolved_by", "resolution_note", "created_at", "id"]
-            st.dataframe(df_gm[cols], use_container_width=True, hide_index=True)
+            df_show = df_gm.copy()
+
+            # busca
+            if search:
+                mask = (
+                    df_show["place"].astype(str).str.lower().str.contains(search)
+                    | df_show["description"].astype(str).str.lower().str.contains(search)
+                    | df_show["technician"].astype(str).str.lower().str.contains(search)
+                    | df_show["status"].astype(str).str.lower().str.contains(search)
+                    | df_show["note"].astype(str).str.lower().str.contains(search)
+                    | df_show["resolution_note"].astype(str).str.lower().str.contains(search)
+                )
+                df_show = df_show[mask].copy()
+
+            st.markdown("### 🧰 Manutenção Geral do dia")
+
+            show_cols = [
+                "maint_date", "place", "description", "status",
+                "technician", "note",
+                "resolved_at", "resolved_by", "resolution_note",
+                "created_at", "id"
+            ]
+
+            st.dataframe(
+                df_show[show_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "maint_date": st.column_config.TextColumn("Data", width="small"),
+                    "place": st.column_config.TextColumn("Local", width="medium"),
+                    "description": st.column_config.TextColumn("Descrição", width="large"),
+                    "status": st.column_config.TextColumn("Status", width="small"),
+                    "technician": st.column_config.TextColumn("Responsável", width="medium"),
+                    "note": st.column_config.TextColumn("Obs.", width="large"),
+                    "resolved_at": st.column_config.TextColumn("Resolvido em", width="small"),
+                    "resolved_by": st.column_config.TextColumn("Resolvido por", width="small"),
+                    "resolution_note": st.column_config.TextColumn("O que foi feito", width="large"),
+                    "created_at": st.column_config.TextColumn("Criado em", width="small"),
+                    "id": st.column_config.NumberColumn("ID", width="small"),
+                },
+            )
+
+            csv = df_show[show_cols].to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Baixar CSV (Geral - dia)",
+                data=csv,
+                file_name=f"dashboard_geral_{day.isoformat()}.csv",
+                mime="text/csv",
+                key="dash_gm_csv"
+            )
 
 elif menu == "Registrar manutenção":
     st.subheader("Registrar manutenção do dia")
@@ -1018,7 +1294,7 @@ elif menu == "Relatórios":
                     mime="text/csv",
                     key="rep_csv"
                 )
-                
+
                 st.markdown("---")
                 st.subheader("🧹 Corrigir / Excluir lançamento (Aptos)")
 
