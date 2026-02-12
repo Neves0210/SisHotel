@@ -337,6 +337,40 @@ def export_unified_xlsx(df_apts: pd.DataFrame, df_resolved: pd.DataFrame, df_gen
         (df_general if not df_general.empty else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Manutenção Geral")
     return output.getvalue()
 
+def delete_report_item(report_item_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # pega o report_id antes de deletar (pra limpeza opcional)
+    cur.execute("SELECT report_id FROM report_items WHERE id = ?", (report_item_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False, None
+
+    report_id = int(row[0])
+
+    cur.execute("DELETE FROM report_items WHERE id = ?", (report_item_id,))
+
+    conn.commit()
+    conn.close()
+    return True, report_id
+
+
+def cleanup_empty_report(report_id: int):
+    """Se um report ficou sem itens, remove o report."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(1) FROM report_items WHERE report_id = ?", (report_id,))
+    count_items = int(cur.fetchone()[0])
+
+    if count_items == 0:
+        cur.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+        conn.commit()
+
+    conn.close()
+
 # ----------------------------
 # MIGRATIONS (produção)
 # ----------------------------
@@ -654,6 +688,7 @@ def fetch_reports(
             r.room_code,
             r.technician,
             r.created_at,
+            ri.id AS report_item_id,
             COALESCE(mi.name, ri.item) AS item,
             ri.status,
             COALESCE(ri.note, '') AS note
@@ -983,6 +1018,57 @@ elif menu == "Relatórios":
                     mime="text/csv",
                     key="rep_csv"
                 )
+                
+                st.markdown("---")
+                st.subheader("🧹 Corrigir / Excluir lançamento (Aptos)")
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    del_from = st.date_input("De (exclusão)", value=date.today(), key="del_from")
+                with c2:
+                    del_to = st.date_input("Até (exclusão)", value=date.today(), key="del_to")
+                with c3:
+                    del_room = st.text_input("Quarto (opcional)", placeholder="Ex: 0101", key="del_room").strip() or None
+
+                if del_from > del_to:
+                    st.error("A data 'De' não pode ser maior que a data 'Até'.")
+                else:
+                    df_del = fetch_reports(del_from, del_to, None, None, del_room, technician=None, status=None)
+
+                    if df_del.empty:
+                        st.info("Nada encontrado nesse filtro.")
+                    else:
+                        # Mostra linhas e permite excluir uma por uma
+                        cols_view = ["report_date", "room_code", "technician", "item", "status", "note", "created_at", "report_id", "report_item_id"]
+                        st.dataframe(df_del[cols_view], use_container_width=True, hide_index=True)
+
+                        st.caption("Escolha uma linha para excluir (somente o item).")
+
+                        # seletor por ID do item
+                        options = [
+                            (int(r["report_item_id"]), f'{r["report_date"]} • {r["room_code"]} • {r["item"]} • {r["status"]}')
+                            for _, r in df_del.iterrows()
+                        ]
+
+                        selected = st.selectbox(
+                            "Selecione o lançamento para excluir",
+                            options=options,
+                            format_func=lambda x: x[1],
+                            key="del_select"
+                        )
+
+                        report_item_id = int(selected[0])
+
+                        confirm = st.checkbox("Confirmo que desejo excluir este lançamento", key="del_confirm")
+
+                        if st.button("🗑️ Excluir lançamento", type="primary", disabled=not confirm, key="del_btn"):
+                            ok, rep_id = delete_report_item(report_item_id)
+                            if not ok:
+                                st.error("Esse lançamento não foi encontrado (talvez já tenha sido excluído).")
+                            else:
+                                cleanup_empty_report(rep_id)
+                                st.success("Lançamento excluído com sucesso! ✅")
+                                st.rerun()
 
     # -----------------------------
     # TAB 2 - RESOLVIDAS
